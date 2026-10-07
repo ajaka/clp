@@ -178,6 +178,10 @@ pub fn parse(args: &[String]) -> Result<Cli> {
 
         match a {
             "-u" | "-i" => {
+                if let Some((prev_inc, _)) = &pending_until {
+                    let prev_flag = if *prev_inc { "-i" } else { "-u" };
+                    bail!("Flags {prev_flag} and {a} are mutually exclusive; use only one");
+                }
                 // Delimiters run until `--` or the next flag. Which of these is the
                 // file cannot be decided here, because a later positional or flag
                 // may still follow; it is resolved after the loop.
@@ -252,13 +256,15 @@ pub fn parse(args: &[String]) -> Result<Cli> {
                 if inclusive { "-i" } else { "-u" }
             );
         }
-        op = Some((
-            if inclusive { "-i" } else { "-u" },
+        let flag = if inclusive { "-i" } else { "-u" };
+        set_operation(
+            &mut op,
+            flag,
             Operation::Until {
                 delimiters,
                 inclusive,
             },
-        ));
+        )?;
     }
 
     // -p and -c address the clipboard directly and take no input.
@@ -331,6 +337,24 @@ mod tests {
         let msg = e.to_string();
         assert!(msg.contains("-r") && msg.contains("-l"), "{msg}");
         assert!(!msg.contains("-u"), "{msg}");
+    }
+
+    #[test]
+    fn until_conflicts_with_other_operations() {
+        let e1 = parse(&v(&["-u", "END", "-l", "5", "f.txt"])).unwrap_err();
+        assert!(e1.to_string().contains("mutually exclusive"), "{e1}");
+
+        let e2 = parse(&v(&["-l", "5", "-u", "END", "f.txt"])).unwrap_err();
+        assert!(e2.to_string().contains("mutually exclusive"), "{e2}");
+    }
+
+    #[test]
+    fn until_rejects_repeated_until_or_inclusive() {
+        let e1 = parse(&v(&["-u", "A", "-u", "B", "f.txt"])).unwrap_err();
+        assert!(e1.to_string().contains("mutually exclusive"), "{e1}");
+
+        let e2 = parse(&v(&["-u", "A", "-i", "B", "f.txt"])).unwrap_err();
+        assert!(e2.to_string().contains("mutually exclusive"), "{e2}");
     }
 
     #[test]

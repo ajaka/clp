@@ -11,12 +11,15 @@ use cli::{Operation, parse};
 use detect_platform::can_proceed;
 
 pub fn begin(args: Vec<String>) -> Result<()> {
-    if !can_proceed()? {
-        bail!("{}", modes::no_manager_message());
+    if args
+        .iter()
+        .any(|a| a == "--help" || a == "-help" || a == "-h")
+    {
+        return modes::help::handle_help();
     }
 
-    if args.iter().any(|a| a == "--help" || a == "-help") {
-        return modes::help::handle_help();
+    if !can_proceed()? {
+        bail!("{}", modes::no_manager_message());
     }
 
     let cli = parse(&args)?;

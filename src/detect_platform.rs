@@ -70,7 +70,6 @@ pub const KNOWN_MANAGERS: &[ManagerInfo] = &[
 #[cfg(target_os = "linux")]
 mod linux {
     use super::{KNOWN_MANAGERS, Result};
-    use anyhow::bail;
     use std::env;
     use std::sync::OnceLock;
     use wayland_client::{
@@ -161,9 +160,20 @@ mod linux {
         check_clipboard_processes()
     }
 
-    /// Check for X11 clipboard support via x11rb (pure Rust, safe, no C libX11 dependency),
-    /// checking CLIPBOARD_MANAGER and CLIPBOARD ownership, then falling back to a process scan.
+    fn is_xclip_available() -> bool {
+        std::process::Command::new("xclip")
+            .arg("-version")
+            .output()
+            .is_ok()
+    }
+
+    /// Check for X11 clipboard support: allows proceeding when xclip is available,
+    /// or via x11rb checking CLIPBOARD_MANAGER and CLIPBOARD ownership, then falling back to a process scan.
     pub fn x11_check() -> bool {
+        if is_xclip_available() {
+            return true;
+        }
+
         let Ok((conn, _screen_num)) = x11rb::connect(None) else {
             return check_clipboard_processes();
         };
@@ -228,13 +238,7 @@ mod linux {
             Platform::Both => Ok(wayland_check() || x11_check()),
             Platform::Wayland => Ok(wayland_check()),
             Platform::X11 => Ok(x11_check()),
-            Platform::Headless => {
-                if check_clipboard_processes() {
-                    Ok(true)
-                } else {
-                    bail!("Headless server not supported")
-                }
-            }
+            Platform::Headless => Ok(check_clipboard_processes()),
         }
     }
 }
