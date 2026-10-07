@@ -47,11 +47,12 @@ struct XclipClipboard;
 impl Clipboard for XclipClipboard {
     fn copy(&mut self, content: &str) -> Result<()> {
         use std::io::Write;
-        use std::process::Command;
+        use std::process::{Command, Stdio};
 
         let mut child = Command::new("xclip")
             .args(["-selection", "clipboard"])
-            .stdin(std::process::Stdio::piped())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
             .spawn()
             .with_context(|| "Failed to spawn xclip (is it installed?)")?;
 
@@ -99,67 +100,139 @@ impl Clipboard for XclipClipboard {
     }
 }
 
-/// Retrieve the active clipboard backend.
+/// Retrieve all available clipboard backends ordered by priority.
 ///
 /// On Linux:
-/// - Prefers `xclip` when in pure X11 (DISPLAY is set and WAYLAND_DISPLAY is unset) if xclip is installed.
-/// - Otherwise uses `arboard` (which supports Wayland data-control).
+/// - When both WAYLAND_DISPLAY and DISPLAY are set, prioritizes Arboard (Wayland data-control)
+///   with xclip (XWayland) as the alternate fallback, or vice versa if xclip is installed.
+/// - When only DISPLAY is set, prioritizes xclip (if installed) with Arboard as fallback.
+/// - Otherwise uses Arboard.
 ///
-/// On non-Linux platforms, uses `arboard`.
-pub fn get_clipboard() -> Result<Box<dyn Clipboard>> {
+/// On non-Linux platforms, uses Arboard.
+pub fn get_backends() -> Result<Vec<Box<dyn Clipboard>>> {
     #[cfg(target_os = "linux")]
     {
         let has_display = std::env::var_os("DISPLAY").is_some();
+        let has_wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();
 
-        if has_display
+        let xclip_available = has_display
             && std::process::Command::new("xclip")
                 .arg("-version")
                 .output()
-                .is_ok()
-        {
-            return Ok(Box::new(XclipClipboard));
+                .is_ok();
+
+        let mut backends: Vec<Box<dyn Clipboard>> = Vec::new();
+
+        if has_display && xclip_available {
+            backends.push(Box::new(XclipClipboard));
+            if let Ok(arboard) = ArboardClipboard::new() {
+                backends.push(Box::new(arboard));
+            }
+        } else if has_wayland {
+            if let Ok(arboard) = ArboardClipboard::new() {
+                backends.push(Box::new(arboard));
+            }
+            if xclip_available {
+                backends.push(Box::new(XclipClipboard));
+            }
+        } else if let Ok(arboard) = ArboardClipboard::new() {
+            backends.push(Box::new(arboard));
         }
-        Ok(Box::new(ArboardClipboard::new()?))
+
+        if backends.is_empty() {
+            anyhow::bail!("No usable clipboard backend found");
+        }
+        Ok(backends)
     }
 
     #[cfg(not(target_os = "linux"))]
     {
-        Ok(Box::new(ArboardClipboard::new()?))
+        let cb = ArboardClipboard::new()?;
+        Ok(vec![Box::new(cb)])
     }
 }
 
-/// Copy text content to the system clipboard.
+/// Retrieve the primary active clipboard backend.
+pub fn get_clipboard() -> Result<Box<dyn Clipboard>> {
+    let mut backends = get_backends()?;
+    Ok(backends.remove(0))
+}
+
+/// Run an operation against available clipboard backends, retrying with the
+/// alternate backend if an operation fails.
+fn run_with_clipboard<T>(mut op: impl FnMut(&mut dyn Clipboard) -> Result<T>) -> Result<T> {
+    let backends = get_backends()?;
+    let mut last_err = None;
+
+    for mut backend in backends {
+        match op(backend.as_mut()) {
+            Ok(val) => return Ok(val),
+            Err(e) => {
+                last_err = Some(e);
+            }
+        }
+    }
+
+    match last_err {
+        Some(e) => Err(e),
+        None => anyhow::bail!("No available clipboard backend"),
+    }
+}
+
+/// Copy text content to the system clipboard, retrying with alternate backend on failure.
 pub fn copy_to_clipboard(content: &str) -> Result<()> {
-    get_clipboard()?.copy(content)
+    run_with_clipboard(|cb| cb.copy(content)).context("Failed to copy to clipboard")
 }
 
-/// Clear the system clipboard.
+/// Clear the system clipboard, retrying with alternate backend on failure.
 pub fn clear_clipboard() -> Result<()> {
-    get_clipboard()?.clear()
+    run_with_clipboard(|cb| cb.clear()).context("Failed to clear clipboard")
 }
 
-/// Paste text content from the system clipboard.
+/// Paste text content from the system clipboard, retrying with alternate backend on failure.
 pub fn paste_from_clipboard() -> Result<String> {
-    get_clipboard()?.paste()
+    run_with_clipboard(|cb| cb.paste()).context("Failed to paste from clipboard")
+}
+
+/// Check if a paste error is caused by known unavailable-text scenarios (empty clipboard
+/// or non-text content), rather than a genuine backend failure.
+fn is_unavailable_text(err: &anyhow::Error) -> bool {
+    if let Some(arboard::Error::ContentNotAvailable) = err.downcast_ref::<arboard::Error>() {
+        return true;
+    }
+    if err.downcast_ref::<std::string::FromUtf8Error>().is_some() {
+        return true;
+    }
+    let msg = err.to_string();
+    msg.contains("valid UTF-8 text") || msg.contains("not available in the requested format")
 }
 
 /// Append text content to the system clipboard.
 ///
 /// Inserts a newline between existing content and new content if the existing
 /// content is not empty and does not end with a newline.
+///
+/// If an operation fails, the entire read-and-write operation is retried with the
+/// alternate backend so both steps use the same backend. Known unavailable-text
+/// errors (e.g. empty clipboard or non-UTF8 text) are treated as empty content,
+/// while genuine read failures are propagated before copying.
 pub fn append_to_clipboard(content: &str) -> Result<()> {
-    let mut clipboard = get_clipboard()?;
-    let existing = clipboard.paste().unwrap_or_default();
-    let new_content = if existing.is_empty() {
-        content.to_string()
-    } else if existing.ends_with('\n') {
-        format!("{}{}", existing, content)
-    } else {
-        format!("{}\n{}", existing, content)
-    };
-    clipboard
-        .copy(&new_content)
-        .context("Failed to copy appended content to clipboard")
+    run_with_clipboard(|cb| {
+        let existing = match cb.paste() {
+            Ok(text) => text,
+            Err(e) if is_unavailable_text(&e) => String::new(),
+            Err(e) => return Err(e),
+        };
+        let new_content = if existing.is_empty() {
+            content.to_string()
+        } else if existing.ends_with('\n') {
+            format!("{}{}", existing, content)
+        } else {
+            format!("{}\n{}", existing, content)
+        };
+        cb.copy(&new_content)
+    })
+    .context("Failed to copy appended content to clipboard")
 }
 
 /// Trim leading and trailing whitespace from content.
@@ -345,5 +418,90 @@ mod tests {
 
         let err = read_source_text(&Source::Path(path)).unwrap_err();
         assert!(err.to_string().contains("contains non-UTF-8 data"));
+    }
+
+    #[test]
+    fn test_retry_with_alternate_backend() {
+        struct FailingClipboard;
+        impl Clipboard for FailingClipboard {
+            fn copy(&mut self, _: &str) -> Result<()> {
+                anyhow::bail!("failing copy")
+            }
+            fn paste(&mut self) -> Result<String> {
+                anyhow::bail!("failing paste")
+            }
+            fn clear(&mut self) -> Result<()> {
+                anyhow::bail!("failing clear")
+            }
+        }
+
+        let mut backends: Vec<Box<dyn Clipboard>> = vec![
+            Box::new(FailingClipboard),
+            Box::new(MockClipboard::new("fallback_content")),
+        ];
+
+        let mut res = None;
+        for b in backends.iter_mut() {
+            if let Ok(val) = b.paste() {
+                res = Some(val);
+                break;
+            }
+        }
+        assert_eq!(res.as_deref(), Some("fallback_content"));
+    }
+
+    #[test]
+    fn test_append_retries_both_steps_on_same_backend() {
+        struct FailingCopyClipboard {
+            paste_val: String,
+        }
+        impl Clipboard for FailingCopyClipboard {
+            fn copy(&mut self, _: &str) -> Result<()> {
+                anyhow::bail!("backend 1 copy rejected")
+            }
+            fn paste(&mut self) -> Result<String> {
+                Ok(self.paste_val.clone())
+            }
+            fn clear(&mut self) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut backends: Vec<Box<dyn Clipboard>> = vec![
+            Box::new(FailingCopyClipboard {
+                paste_val: "b1_stale".to_string(),
+            }),
+            Box::new(MockClipboard::new("b2_existing")),
+        ];
+
+        let content = "new_data";
+        let mut completed = false;
+
+        for b in backends.iter_mut() {
+            let cb_op = |cb: &mut Box<dyn Clipboard>| -> Result<()> {
+                let existing = cb.paste().unwrap_or_default();
+                let combined = format!("{existing}\n{content}");
+                cb.copy(&combined)
+            };
+            if cb_op(b).is_ok() {
+                completed = true;
+                break;
+            }
+        }
+
+        assert!(completed);
+        assert_eq!(backends[1].paste().unwrap(), "b2_existing\nnew_data");
+    }
+
+    #[test]
+    fn test_is_unavailable_text() {
+        let not_avail: anyhow::Error = arboard::Error::ContentNotAvailable.into();
+        assert!(is_unavailable_text(&not_avail));
+
+        let generic_err = anyhow::anyhow!("xclip failed with exit code: 1");
+        assert!(!is_unavailable_text(&generic_err));
+
+        let utf8_msg = anyhow::anyhow!("Clipboard content does not contain valid UTF-8 text");
+        assert!(is_unavailable_text(&utf8_msg));
     }
 }
